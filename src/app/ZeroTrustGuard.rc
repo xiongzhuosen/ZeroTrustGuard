@@ -1,0 +1,49 @@
+#include <windows.h>
+#include "resource.h"
+
+IDI_ICON_32 ICON "..\\..\\res\\32.ico"
+IDI_ICON_16 ICON "..\\..\\res\\16.ico"
+
+IDD_TOTP_PROMPT DIALOGEX 0, 0, 260, 108
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "管理员验证"
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "请输入 6 位 TOTP 动态码以继续:", IDC_TOTP_MESSAGE, 14, 12, 232, 16
+    EDITTEXT        IDC_TOTP_CODE, 80, 36, 100, 16, ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "确定", IDOK, 70, 78, 54, 16
+    PUSHBUTTON      "取消", IDCANCEL, 136, 78, 54, 16
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     4,0,0,0
+ PRODUCTVERSION  4,0,0,0
+ FILEFLAGSMASK   0x3fL
+#ifdef _DEBUG
+ FILEFLAGS       0x1L
+#else
+ FILEFLAGS       0x0L
+#endif
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "ZeroTrust"
+            VALUE "FileDescription", "ZeroTrustGuard 零信任行为防护"
+            VALUE "FileVersion", "4.0.0.0"
+            VALUE "InternalName", "ZeroTrustGuard.exe"
+            VALUE "LegalCopyright", "Copyright (C) 2026 ZeroTrust"
+            VALUE "OriginalFilename", "ZeroTrustGuard.exe"
+            VALUE "ProductName", "ZeroTrustGuard"
+            VALUE "ProductVersion", "4.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

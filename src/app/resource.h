@@ -1,0 +1,13 @@
+#pragma once
+
+#define IDI_ICON_32 300
+#define IDI_ICON_16 301
+
+#define IDD_TOTP_PROMPT 1250
+#define IDC_TOTP_CODE   1251
+#define IDC_TOTP_MESSAGE 1252
+
+#define IDD_EULA 1260
+#define IDC_EULA_TEXT 1261
+
+#define IDR_MAINMENU 2000

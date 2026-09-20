@@ -1,0 +1,102 @@
+name: Windows Native Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: MSVC + WDK on windows-2022
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Locate Visual Studio
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $path = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $path) { throw "Visual Studio installation not found" }
+          "install=$path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "VS: $path"
+
+      - name: Enable WDK Visual Studio integration
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $vsPath = "${{ steps.vs.outputs.install }}"
+          $args = @(
+            "modify",
+            "--installPath", $vsPath,
+            "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621",
+            "--add", "Component.Microsoft.Windows.DriverKit",
+            "--quiet", "--norestart", "--wait"
+          )
+          $p = Start-Process -FilePath $setup -ArgumentList $args -Wait -PassThru -NoNewWindow
+          Write-Host "VS modify exit: $($p.ExitCode)"
+
+      - name: Install Windows Driver Kit
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $wdkSetup = Join-Path $env:TEMP "wdksetup.exe"
+          $uris = @(
+            "https://go.microsoft.com/fwlink/?linkid=2286561",
+            "https://go.microsoft.com/fwlink/?linkid=2249371"
+          )
+          foreach ($uri in $uris) {
+            try {
+              Write-Host "Downloading WDK from $uri"
+              Invoke-WebRequest -Uri $uri -OutFile $wdkSetup -UseBasicParsing
+              $w = Start-Process -FilePath $wdkSetup -ArgumentList "/features","+","/quiet","/norestart" -Wait -PassThru
+              Write-Host "WDK setup exit: $($w.ExitCode)"
+              if ($w.ExitCode -eq 0 -or $w.ExitCode -eq 3010) { break }
+            } catch {
+              Write-Warning $_
+            }
+          }
+
+      - name: Native MSVC build
+        shell: pwsh
+        run: |
+          $cfg = "Release"
+          if ("${{ github.event.inputs.configuration }}") {
+            $cfg = "${{ github.event.inputs.configuration }}"
+          }
+          .\tools\build.ps1 -Configuration $cfg -Platform x64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroTrustGuard-windows-x64
+          path: |
+            out/x64/**/*.exe
+            out/x64/**/*.sys
+            out/x64/**/*.pdb
+            out/x64/**/*.inf
+            out/x64/**/*.ico
+          if-no-files-found: error
+          retention-days: 30

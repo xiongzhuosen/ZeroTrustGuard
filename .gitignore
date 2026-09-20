@@ -1,0 +1,14 @@
+out/
+obj/
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.aps
+*.log
+.monkeycode-tmp-files/
+packages/
+.gitcode/
