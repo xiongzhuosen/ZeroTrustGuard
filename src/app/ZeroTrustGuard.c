@@ -1,7 +1,6 @@
 #define _WIN32_WINNT 0x0A00
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
-#include <initguid.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -73,7 +72,8 @@
 #define IDC_LOG_VIEW 4201
 #define IDC_QUAR_LIST 4202
 
-DEFINE_GUID(ZTG_WFP_PROVIDER_GUID, 0xa5422d3a, 0x291d, 0x4e15, 0x91, 0x7a, 0xa1, 0x67, 0xa6, 0xb5, 0x3b, 0x4b);
+static const GUID ZTG_WFP_PROVIDER_GUID =
+    { 0xa5422d3a, 0x291d, 0x4e15, { 0x91, 0x7a, 0xa1, 0x67, 0xa6, 0xb5, 0x3b, 0x4b } };
 
 typedef struct {
     WCHAR whiteDirs[512];
