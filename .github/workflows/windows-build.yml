@@ -79,6 +79,20 @@ jobs:
             }
           }
 
+      - name: Diagnose WDK and SDK
+        shell: pwsh
+        run: |
+          Write-Host "== Windows Kits Include =="
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          Write-Host "== Windows Kits Lib =="
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          Write-Host "== KitsRoot10 =="
+          (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots" -ErrorAction SilentlyContinue).KitsRoot10
+          Write-Host "== WDK toolset props =="
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          Write-Host "== NuGet packages =="
+          Get-ChildItem "${{ github.workspace }}\packages" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+
       - name: Native MSVC build
         shell: pwsh
         run: |

@@ -17,6 +17,10 @@
     <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup>
+    <WindowsSdkDir Condition="'$(WindowsSdkDir)' == ''">$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</WindowsSdkDir>
+    <WindowsSdkDir Condition="'$(WindowsSdkDir)' == ''">$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</WindowsSdkDir>
+  </PropertyGroup>
   <Import Project="$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.WDK.x64.10.0.26100.3323\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.WDK.x64.10.0.26100.3323\build\native\Microsoft.Windows.WDK.x64.props')" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
