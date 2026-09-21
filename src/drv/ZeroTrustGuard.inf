@@ -29,7 +29,7 @@ CopyFiles=Files.Driver
 ZeroTrustGuardDrv.sys,,,0x00000002
 
 [ZeroTrustGuardInstall.NT.Services]
-AddService=ZeroTrustGuardDrv,,ZeroTrustGuardService
+AddService=ZeroTrustGuardDrv,0x00000002,ZeroTrustGuardService
 
 [ZeroTrustGuardService]
 DisplayName=%ServiceName%
