@@ -11,6 +11,11 @@ Set-Location $Root
 function Find-MSBuild {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
+        $install = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+        if ($install) {
+            $amd64 = Join-Path $install "MSBuild\Current\Bin\amd64\MSBuild.exe"
+            if (Test-Path $amd64) { return $amd64 }
+        }
         $path = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
         if ($path) { return $path }
     }
