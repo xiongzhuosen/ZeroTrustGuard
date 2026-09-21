@@ -34,7 +34,7 @@ function Complete-WdkHostTools {
             $x64 = Join-Path $verDir "x64"
             if (-not (Test-Path $x64)) { return }
             New-Item -ItemType Directory -Force -Path $x86 | Out-Null
-            Get-ChildItem $x64 -File | Where-Object { $_.Extension -eq ".exe" -or $_.Extension -eq ".dll" } | ForEach-Object {
+            Get-ChildItem $x64 -File -Filter *.exe | ForEach-Object {
                 $dest = Join-Path $x86 $_.Name
                 if (-not (Test-Path $dest)) {
                     Copy-Item $_.FullName -Destination $dest -Force
