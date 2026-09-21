@@ -22,6 +22,29 @@ function Find-MSBuild {
     throw "MSBuild not found. Install Visual Studio 2022 with C++ workload."
 }
 
+function Complete-WdkHostTools {
+    $pkgRoot = Join-Path $Root "packages"
+    if (-not (Test-Path $pkgRoot)) { return }
+    Get-ChildItem $pkgRoot -Directory -Filter "Microsoft.Windows.WDK.*" | ForEach-Object {
+        $binRoot = Join-Path $_.FullName "c\bin"
+        if (-not (Test-Path $binRoot)) { return }
+        Get-ChildItem $binRoot -Directory | ForEach-Object {
+            $verDir = $_.FullName
+            $x86 = Join-Path $verDir "x86"
+            $x64 = Join-Path $verDir "x64"
+            if (-not (Test-Path $x64)) { return }
+            New-Item -ItemType Directory -Force -Path $x86 | Out-Null
+            Get-ChildItem $x64 -File | Where-Object { $_.Extension -eq ".exe" -or $_.Extension -eq ".dll" } | ForEach-Object {
+                $dest = Join-Path $x86 $_.Name
+                if (-not (Test-Path $dest)) {
+                    Copy-Item $_.FullName -Destination $dest -Force
+                    Write-Host "WDK shim: $($_.Name) -> x86"
+                }
+            }
+        }
+    }
+}
+
 function Test-Wdk {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $vswhere)) { return $false }
@@ -55,6 +78,7 @@ Copy-Item (Join-Path $Root "res\32.ico") -Destination $outDir -Force
 
 if (Test-Wdk) {
     Write-Host "WDK toolset found. Building kernel driver..."
+    Complete-WdkHostTools
     & $msbuild $drvProj /t:Build /p:Configuration=$Configuration /p:Platform=$Platform /m /v:m
     if ($LASTEXITCODE -ne 0) { throw "Driver build failed" }
 } else {
