@@ -46,7 +46,7 @@ typedef struct _ZTG_CONFIG_V2 {
     BOOLEAN blockRansomTools;
     BOOLEAN enableUntrustedPath;
     BOOLEAN enableCanaryProtect;
-    BYTE  reserved[249];
+    UCHAR reserved[249];
 } ZTG_CONFIG_V2;
 
 typedef struct _ZTG_STATS {
