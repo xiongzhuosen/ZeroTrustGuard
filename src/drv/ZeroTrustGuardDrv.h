@@ -5,7 +5,6 @@
 #include "../../include/ZtgShared.h"
 
 NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
-NTKERNELAPI NTSTATUS NTAPI SeLocateProcessImageName(_In_ PEPROCESS Process, _Outptr_ PUNICODE_STRING* pImageFileName);
 
 extern ZTG_CONFIG_V2 g_Config;
 

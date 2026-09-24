@@ -263,25 +263,45 @@ static BOOLEAN ExtBlocked(_In_ PCUNICODE_STRING path)
 
 static BOOLEAN IsPathOnRemovableMedia(_In_ PCUNICODE_STRING path)
 {
+    static const WCHAR prefix[] = L"\\Device\\";
     PDEVICE_OBJECT deviceObject = NULL;
     PFILE_OBJECT fileObject = NULL;
-    BOOLEAN isRemovable = FALSE;
+    UNICODE_STRING dev;
+    WCHAR devName[80];
+    USHORT chars, end;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL || !path || !path->Buffer) {
         return FALSE;
     }
 
-    if (!NT_SUCCESS(IoGetDeviceObjectPointer(path, FILE_READ_ATTRIBUTES, &fileObject, &deviceObject))) {
+    chars = path->Length / sizeof(WCHAR);
+    if (chars < 10) {
+        return FALSE;
+    }
+    for (ULONG k = 0; k < 8; k++) {
+        if (path->Buffer[k] != prefix[k]) {
+            return FALSE;
+        }
+    }
+
+    end = 8;
+    while (end < chars && path->Buffer[end] != L'\\') {
+        end++;
+    }
+    if (end >= chars || end > ARRAYSIZE(devName)) {
         return FALSE;
     }
 
-    PDEVICE_OBJECT storage = IoGetLowestDeviceObject(deviceObject);
-    if (storage) {
-        if (storage->Characteristics & FILE_REMOVABLE_MEDIA) {
-            isRemovable = TRUE;
-        }
-        ObDereferenceObject(storage);
+    RtlCopyMemory(devName, path->Buffer, end * sizeof(WCHAR));
+    dev.Buffer = devName;
+    dev.Length = (USHORT)(end * sizeof(WCHAR));
+    dev.MaximumLength = dev.Length;
+
+    if (!NT_SUCCESS(IoGetDeviceObjectPointer(&dev, FILE_READ_ATTRIBUTES, &fileObject, &deviceObject))) {
+        return FALSE;
     }
+
+    BOOLEAN isRemovable = (deviceObject->Characteristics & FILE_REMOVABLE_MEDIA) ? TRUE : FALSE;
     ObDereferenceObject(fileObject);
     return isRemovable;
 }
@@ -719,7 +739,7 @@ NTSTATUS IrpDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return status;
 }
 
-static NTSTATUS RegisterCallbacks(VOID)
+static NTSTATUS RegisterCallbacks(_In_ PDRIVER_OBJECT DriverObject)
 {
     NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallbackEx, FALSE);
     if (!NT_SUCCESS(status)) {
@@ -733,7 +753,9 @@ static NTSTATUS RegisterCallbacks(VOID)
     }
     g_ImageNotify = TRUE;
 
-    status = CmRegisterCallback(RegProtectCallback, NULL, &g_RegCookie);
+    UNICODE_STRING regAltitude;
+    RtlInitUnicodeString(&regAltitude, L"321000");
+    status = CmRegisterCallbackEx(RegProtectCallback, &regAltitude, DriverObject, NULL, &g_RegCookie, NULL);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -834,7 +856,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpDeviceControl;
     DriverObject->DriverUnload = DriverUnload;
 
-    status = RegisterCallbacks();
+    status = RegisterCallbacks(DriverObject);
     if (!NT_SUCCESS(status)) {
         UnregisterCallbacks();
         IoDeleteSymbolicLink(&symLink);

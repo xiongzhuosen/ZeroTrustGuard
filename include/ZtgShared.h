@@ -36,7 +36,7 @@ typedef struct _ZTG_CONFIG_V2 {
     WCHAR usbWhitelist[512];
     WCHAR logPath[260];
     WCHAR regStartupWhite[256];
-    BOOL  blockDLLHijack;
+    BOOLEAN blockDLLHijack;
     BOOLEAN blockUsbExec;
     BOOLEAN enableExtBlock;
     BOOLEAN enableLolBins;

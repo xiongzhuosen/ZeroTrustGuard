@@ -509,7 +509,7 @@ static void SendConfigToDriver(void)
     StringCchCopyW(cfg.usbWhitelist, ARRAYSIZE(cfg.usbWhitelist), gCfg.usbWhitelist);
     StringCchCopyW(cfg.logPath, ARRAYSIZE(cfg.logPath), gCfg.logPath);
     StringCchCopyW(cfg.regStartupWhite, ARRAYSIZE(cfg.regStartupWhite), gCfg.regStartupWhite);
-    cfg.blockDLLHijack = gCfg.blockDLLHijack;
+    cfg.blockDLLHijack = gCfg.blockDLLHijack ? TRUE : FALSE;
     cfg.blockUsbExec = gCfg.blockUsbExec ? TRUE : FALSE;
     cfg.enableExtBlock = gCfg.enableExtBlock ? TRUE : FALSE;
     cfg.enableLolBins = gCfg.enableLolBins ? TRUE : FALSE;
