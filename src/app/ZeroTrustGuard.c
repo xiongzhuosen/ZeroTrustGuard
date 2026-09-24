@@ -18,6 +18,8 @@
 #include <winhttp.h>
 #include <fwpmu.h>
 #include <tlhelp32.h>
+#include <iphlpapi.h>
+#include <winsvc.h>
 #include <sddl.h>
 #include <strsafe.h>
 #include <shlwapi.h>
@@ -57,7 +59,7 @@
 #define IDT_STATS 1
 #define IDT_EVENTS 2
 #define IDT_HEARTBEAT 3
-#define NAV_COUNT 10
+#define NAV_COUNT 12
 #define IDC_SIDEBAR_BASE 4000
 #define IDC_SAVE 4100
 #define IDC_BROWSE_LOG 4101
@@ -68,9 +70,15 @@
 #define IDC_QUAR_PURGE 4106
 #define IDC_SCAN_FILE 4107
 #define IDC_CANARY_PLANT 4108
+#define IDC_HEALTH_CHECK 4109
+#define IDC_NET_REFRESH 4110
+#define IDC_EVT_CLEAR 4111
+#define IDC_EXPORT_REPORT 4112
 #define IDC_EVT_LIST 4200
 #define IDC_LOG_VIEW 4201
 #define IDC_QUAR_LIST 4202
+#define IDC_POSTURE_LIST 4203
+#define IDC_NET_LIST 4204
 
 static const GUID ZTG_WFP_PROVIDER_GUID =
     { 0xa5422d3a, 0x291d, 0x4e15, { 0x91, 0x7a, 0xa1, 0x67, 0xa6, 0xb5, 0x3b, 0x4b } };
@@ -183,7 +191,16 @@ static HWND gChecks[32];
 static HWND gEvtList = NULL;
 static HWND gLogView = NULL;
 static HWND gQuarList = NULL;
+static HWND gPostureList = NULL;
+static HWND gNetList = NULL;
 static HWND gStatus = NULL;
+static int gNavHover = -1;
+static BOOL gNavTracking = FALSE;
+static int gPostureScore = 0;
+static int gPosturePassed = 0;
+static int gPostureTotal = 0;
+static wchar_t gLastEventTime[16] = L"--:--:--";
+static int gEvtCount = 0;
 
 static void Log(const wchar_t* fmt, ...);
 static void SendConfigToDriver(void);
@@ -202,6 +219,10 @@ static BOOL QuarantineFile(LPCWSTR filePath);
 static void RefreshQuarantineList(void);
 static void PlantCanaries(void);
 static void HuntPersistence(void);
+static void RunHealthCheck(void);
+static void RefreshNetworkView(void);
+static BOOL PidToPath(DWORD pid, wchar_t* out, size_t outChars);
+static void ExportReport(void);
 static INT_PTR CALLBACK TotpPromptDlgProc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK LowLevelKeyboardProc(int, WPARAM, LPARAM);
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -1469,6 +1490,295 @@ static DWORD WINAPI PersistHuntThread(LPVOID lp)
     return 0;
 }
 
+static BOOL PidToPath(DWORD pid, wchar_t* out, size_t outChars)
+{
+    if (!out || outChars == 0) {
+        return FALSE;
+    }
+    out[0] = 0;
+    if (pid == 0) {
+        return FALSE;
+    }
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) {
+        return FALSE;
+    }
+    DWORD n = (DWORD)outChars;
+    BOOL ok = QueryFullProcessImageNameW(p, 0, out, &n);
+    CloseHandle(p);
+    return ok;
+}
+
+static BOOL ServiceIsRunning(LPCWSTR name)
+{
+    BOOL running = FALSE;
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (scm) {
+        SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+        if (svc) {
+            SERVICE_STATUS st;
+            if (QueryServiceStatus(svc, &st) && st.dwCurrentState == SERVICE_RUNNING) {
+                running = TRUE;
+            }
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
+    }
+    return running;
+}
+
+static BOOL ReadRegDword(HKEY root, const wchar_t* sub, const wchar_t* name, DWORD* out)
+{
+    HKEY k;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+    DWORD type = 0, cb = sizeof(DWORD), val = 0;
+    LONG r = RegQueryValueExW(k, name, NULL, &type, (LPBYTE)&val, &cb);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || type != REG_DWORD) {
+        return FALSE;
+    }
+    *out = val;
+    return TRUE;
+}
+
+static void PostureAdd(const wchar_t* item, BOOL pass, const wchar_t* advice)
+{
+    gPostureTotal++;
+    if (pass) {
+        gPosturePassed++;
+    }
+    if (!gPostureList) {
+        return;
+    }
+    LVITEMW it = { 0 };
+    it.mask = LVIF_TEXT | LVIF_PARAM;
+    it.iItem = ListView_GetItemCount(gPostureList);
+    it.pszText = (LPWSTR)item;
+    it.lParam = pass ? 1 : 0;
+    int row = ListView_InsertItem(gPostureList, &it);
+    ListView_SetItemText(gPostureList, row, 1, (LPWSTR)(pass ? L"通过" : L"风险"));
+    ListView_SetItemText(gPostureList, row, 2, (LPWSTR)advice);
+}
+
+static void RunHealthCheck(void)
+{
+    gPostureScore = 0;
+    gPosturePassed = 0;
+    gPostureTotal = 0;
+    if (gPostureList) {
+        ListView_DeleteAllItems(gPostureList);
+    }
+
+    DWORD v = 0;
+
+    PostureAdd(L"内核行为引擎", gDriverOk, gDriverOk ? L"驱动已连接，实时拦截生效" : L"以管理员运行并安装驱动 ZeroTrustGuardDrv");
+
+    PostureAdd(L"Windows Defender 实时保护", ServiceIsRunning(L"WinDefend"), L"在 安全中心 启用实时保护");
+
+    BOOL fw = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+        L"EnableFirewall", &v) && v == 1;
+    PostureAdd(L"Windows 防火墙", fw, L"启用防火墙并阻止入站未知连接");
+
+    BOOL uac = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"EnableLUA", &v) && v == 1;
+    PostureAdd(L"UAC 用户账户控制", uac, L"将 EnableLUA 设为 1 并保持默认提示级别");
+
+    BOOL sb = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", L"UEFISecureBootEnabled", &v) && v == 1;
+    PostureAdd(L"UEFI 安全启动", sb, L"在固件设置中开启 Secure Boot");
+
+    BOOL ppl = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Lsa", L"RunAsPPL", &v) && v >= 1;
+    PostureAdd(L"LSA 保护 (RunAsPPL)", ppl, L"设置 RunAsPPL=1 防止凭据转储");
+
+    BOOL cg = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Lsa", L"LsaCfgFlags", &v) && v >= 1;
+    PostureAdd(L"Credential Guard", cg, L"开启基于虚拟化的凭据保护");
+
+    BOOL smb1 = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters", L"SMB1", &v) && v == 0;
+    PostureAdd(L"禁用 SMBv1", smb1, L"将 LanmanServer\\Parameters\\SMB1 设为 0");
+
+    BOOL rdp = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server", L"fDenyTSConnections", &v) && v == 1;
+    PostureAdd(L"禁用远程桌面", rdp, L"如无需要，设置 fDenyTSConnections=1");
+
+    BOOL autorun = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", L"NoDriveTypeAutoRun", &v) && v != 0;
+    PostureAdd(L"禁用自动播放", autorun, L"通过组策略禁用所有驱动器的自动运行");
+
+    BOOL ss = ReadRegDword(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Policies\\Microsoft\\Windows\\System", L"EnableSmartScreen", &v) && v == 1;
+    PostureAdd(L"SmartScreen 筛选", ss, L"启用 SmartScreen 应用与浏览器筛选");
+
+    PostureAdd(L"Windows Update 服务", ServiceIsRunning(L"wuauserv"), L"保持更新服务运行以获取补丁");
+
+    PostureAdd(L"注册表持久化防护", gCfg.enablePersistProtect, L"在 强化 页启用 拦截持久化写入");
+    PostureAdd(L"LSASS 句柄防护", gCfg.enableLsassProtect, L"在 强化 页启用 保护 LSASS");
+
+    if (gPostureTotal > 0) {
+        gPostureScore = (int)((gPosturePassed * 100) / gPostureTotal);
+    }
+    Log(L"health check done, score=%d (%d/%d)", gPostureScore, gPosturePassed, gPostureTotal);
+}
+
+static void InetToStr(DWORD addr, DWORD port, wchar_t* out, size_t outChars)
+{
+    struct in_addr a;
+    a.S_un.S_addr = addr;
+    char ip[INET_ADDRSTRLEN] = { 0 };
+    char full[64];
+    if (!inet_ntop(AF_INET, &a, ip, sizeof(ip))) {
+        StringCchCopyA(ip, sizeof(ip), "0.0.0.0");
+    }
+    StringCchPrintfA(full, sizeof(full), "%s:%u", ip, (unsigned)ntohs((u_short)port));
+    MultiByteToWideChar(CP_UTF8, 0, full, -1, out, (int)outChars);
+}
+
+static const wchar_t* TcpStateName(DWORD s)
+{
+    switch (s) {
+    case MIB_TCP_STATE_CLOSED: return L"CLOSED";
+    case MIB_TCP_STATE_LISTEN: return L"LISTEN";
+    case MIB_TCP_STATE_SYN_SENT: return L"SYN_SENT";
+    case MIB_TCP_STATE_SYN_RCVD: return L"SYN_RCVD";
+    case MIB_TCP_STATE_ESTAB: return L"ESTABLISHED";
+    case MIB_TCP_STATE_FIN_WAIT1: return L"FIN_WAIT1";
+    case MIB_TCP_STATE_FIN_WAIT2: return L"FIN_WAIT2";
+    case MIB_TCP_STATE_CLOSE_WAIT: return L"CLOSE_WAIT";
+    case MIB_TCP_STATE_CLOSING: return L"CLOSING";
+    case MIB_TCP_STATE_LAST_ACK: return L"LAST_ACK";
+    case MIB_TCP_STATE_TIME_WAIT: return L"TIME_WAIT";
+    case MIB_TCP_STATE_DELETE_TCB: return L"DELETE_TCB";
+    default: return L"?";
+    }
+}
+
+static void NetAddRow(const wchar_t* proto, const wchar_t* local, const wchar_t* remote,
+                      const wchar_t* state, DWORD pid)
+{
+    if (!gNetList) {
+        return;
+    }
+    LVITEMW it = { 0 };
+    it.mask = LVIF_TEXT;
+    it.iItem = ListView_GetItemCount(gNetList);
+    it.pszText = (LPWSTR)proto;
+    int row = ListView_InsertItem(gNetList, &it);
+    ListView_SetItemText(gNetList, row, 1, (LPWSTR)local);
+    ListView_SetItemText(gNetList, row, 2, (LPWSTR)remote);
+    ListView_SetItemText(gNetList, row, 3, (LPWSTR)state);
+    wchar_t id[16];
+    StringCchPrintfW(id, ARRAYSIZE(id), L"%u", pid);
+    ListView_SetItemText(gNetList, row, 4, id);
+    wchar_t proc[MAX_PATH];
+    if (PidToPath(pid, proc, ARRAYSIZE(proc))) {
+        ListView_SetItemText(gNetList, row, 5, PathFindFileNameW(proc));
+    } else {
+        ListView_SetItemText(gNetList, row, 5, (LPWSTR)L"-");
+    }
+}
+
+static void RefreshNetworkView(void)
+{
+    if (!gNetList) {
+        return;
+    }
+    ListView_DeleteAllItems(gNetList);
+
+    DWORD size = 0;
+    if (GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER) {
+        MIB_TCPTABLE_OWNER_PID* t = (MIB_TCPTABLE_OWNER_PID*)malloc(size);
+        if (t && GetExtendedTcpTable(t, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+            for (DWORD i = 0; i < t->dwNumEntries; i++) {
+                MIB_TCPROW_OWNER_PID* r = &t->table[i];
+                wchar_t local[64], remote[64];
+                InetToStr(r->dwLocalAddr, r->dwLocalPort, local, ARRAYSIZE(local));
+                if (r->dwRemoteAddr == 0) {
+                    StringCchCopyW(remote, ARRAYSIZE(remote), L"-");
+                } else {
+                    InetToStr(r->dwRemoteAddr, r->dwRemotePort, remote, ARRAYSIZE(remote));
+                }
+                NetAddRow(L"TCP", local, remote, TcpStateName(r->dwState), r->dwOwningPid);
+            }
+        }
+        free(t);
+    }
+
+    size = 0;
+    if (GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == ERROR_INSUFFICIENT_BUFFER) {
+        MIB_UDPTABLE_OWNER_PID* t = (MIB_UDPTABLE_OWNER_PID*)malloc(size);
+        if (t && GetExtendedUdpTable(t, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+            for (DWORD i = 0; i < t->dwNumEntries; i++) {
+                MIB_UDPROW_OWNER_PID* r = &t->table[i];
+                wchar_t local[64];
+                InetToStr(r->dwLocalAddr, r->dwLocalPort, local, ARRAYSIZE(local));
+                NetAddRow(L"UDP", local, L"-", L"-", r->dwOwningPid);
+            }
+        }
+        free(t);
+    }
+    Log(L"network view refreshed, rows=%d", ListView_GetItemCount(gNetList));
+}
+
+static void ExportReport(void)
+{
+    if (!EnsureLogPath()) {
+        MessageBoxW(gMain, L"日志目录不可用，无法导出报告。", L"ZeroTrustGuard", MB_ICONERROR);
+        return;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t path[MAX_PATH];
+    StringCchCopyW(path, MAX_PATH, gCfg.logPath);
+    wchar_t name[80];
+    StringCchPrintfW(name, ARRAYSIZE(name), L"\\report_%04d%02d%02d_%02d%02d%02d.txt",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    StringCchCatW(path, MAX_PATH, name);
+
+    FILE* fp = _wfopen(path, L"w, ccs=UTF-8");
+    if (!fp) {
+        MessageBoxW(gMain, L"无法写入报告文件。", L"ZeroTrustGuard", MB_ICONERROR);
+        return;
+    }
+    fwprintf(fp, L"ZeroTrustGuard 4.0 安全报告\n");
+    fwprintf(fp, L"生成时间: %04d-%02d-%02d %02d:%02d:%02d\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    fwprintf(fp, L"内核驱动: %s\n", gDriverOk ? L"已连接" : L"未连接");
+    fwprintf(fp, L"体检评分: %d/100 (%d/%d 通过)\n\n", gPostureScore, gPosturePassed, gPostureTotal);
+    fwprintf(fp, L"[拦截统计]\n");
+    fwprintf(fp, L"  进程拦截: %llu\n", gStats.blockedProcesses);
+    fwprintf(fp, L"  LOLBin 拦截: %llu\n", gStats.blockedLolBins);
+    fwprintf(fp, L"  行为拦截: %llu\n", gStats.blockedBehavior);
+    fwprintf(fp, L"  LSASS 保护: %llu\n", gStats.protectedLsass);
+    fwprintf(fp, L"  持久化拦截: %llu\n", gStats.blockedPersist);
+    fwprintf(fp, L"  勒索拦截: %llu\n", gStats.blockedRansom);
+    fwprintf(fp, L"  映像拦截: %llu\n", gStats.blockedImages);
+    fwprintf(fp, L"  句柄剥离: %llu\n", gStats.strippedHandles);
+    fwprintf(fp, L"  用户态隔离: %llu\n", gUserQuarantined);
+    fwprintf(fp, L"  下载拦截: %llu\n", gUserDownloadBlocked);
+    fwprintf(fp, L"  持久化命中: %llu\n\n", gUserPersistFound);
+
+    fwprintf(fp, L"[体检明细]\n");
+    if (gPostureList) {
+        int n = ListView_GetItemCount(gPostureList);
+        for (int i = 0; i < n; i++) {
+            wchar_t item[128], state[32], advice[256];
+            ListView_GetItemText(gPostureList, i, 0, item, ARRAYSIZE(item));
+            ListView_GetItemText(gPostureList, i, 1, state, ARRAYSIZE(state));
+            ListView_GetItemText(gPostureList, i, 2, advice, ARRAYSIZE(advice));
+            fwprintf(fp, L"  [%s] %s - %s\n", state, item, advice);
+        }
+    } else {
+        fwprintf(fp, L"  (未执行体检)\n");
+    }
+    fclose(fp);
+    Log(L"report exported: %s", path);
+    MessageBoxW(gMain, path, L"报告已导出", MB_ICONINFORMATION);
+}
+
 static DWORD WINAPI EventPumpThread(LPVOID lp)
 {
     UNREFERENCED_PARAMETER(lp);
@@ -1743,10 +2053,13 @@ static void HideSettings(HWND h)
     if (gEvtList) ShowWindow(gEvtList, SW_HIDE);
     if (gLogView) ShowWindow(gLogView, SW_HIDE);
     if (gQuarList) ShowWindow(gQuarList, SW_HIDE);
+    if (gPostureList) ShowWindow(gPostureList, SW_HIDE);
+    if (gNetList) ShowWindow(gNetList, SW_HIDE);
     HWND extra[] = {
         GetDlgItem(h, IDC_BROWSE_LOG), GetDlgItem(h, IDC_TEST_CLOUD), GetDlgItem(h, IDC_TEST_VT),
         GetDlgItem(h, IDC_HUNT), GetDlgItem(h, IDC_QUAR_RESTORE), GetDlgItem(h, IDC_QUAR_PURGE),
-        GetDlgItem(h, IDC_SCAN_FILE), GetDlgItem(h, IDC_CANARY_PLANT)
+        GetDlgItem(h, IDC_SCAN_FILE), GetDlgItem(h, IDC_CANARY_PLANT),
+        GetDlgItem(h, IDC_HEALTH_CHECK), GetDlgItem(h, IDC_NET_REFRESH), GetDlgItem(h, IDC_EVT_CLEAR)
     };
     for (int i = 0; i < ARRAYSIZE(extra); i++) if (extra[i]) ShowWindow(extra[i], SW_HIDE);
 }
@@ -1754,35 +2067,54 @@ static void HideSettings(HWND h)
 static void LayoutPage(HWND h)
 {
     HideSettings(h);
+    RECT rc;
+    GetClientRect(h, &rc);
+    int cw = rc.right;
+    int chh = rc.bottom;
+    if (cw < 1000) cw = 1000;
+    if (chh < 700) chh = 700;
     int x = 236, y = 88;
+    int contentW = cw - x - 28;
+
+    HWND save = GetDlgItem(h, IDC_SAVE);
+    HWND exp = GetDlgItem(h, IDC_EXPORT_REPORT);
+    int saveW = 128, expW = 128;
+    int saveX = cw - 28 - saveW;
+    int expX = saveX - 12 - expW;
+    if (save) SetWindowPos(save, NULL, saveX, 22, saveW, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+    if (exp) SetWindowPos(exp, NULL, expX, 22, expW, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+
     switch (gNav) {
-    case 0:
-        if (gEvtList) SetWindowPos(gEvtList, NULL, x, 268, 820, 372, SWP_NOZORDER | SWP_SHOWWINDOW);
-        {
-            HWND b = GetDlgItem(h, IDC_SCAN_FILE);
-            if (b) SetWindowPos(b, NULL, x + 680, 236, 140, 28, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
+    case 0: {
+        HWND sf = GetDlgItem(h, IDC_SCAN_FILE);
+        HWND hh = GetDlgItem(h, IDC_HUNT);
+        HWND ec = GetDlgItem(h, IDC_EVT_CLEAR);
+        if (sf) SetWindowPos(sf, NULL, x, y + 162, 140, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (hh) SetWindowPos(hh, NULL, x + 152, y + 162, 160, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (ec) SetWindowPos(ec, NULL, x + 324, y + 162, 140, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEvtList) SetWindowPos(gEvtList, NULL, x, y + 204, contentW, chh - (y + 204) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
+    }
     case 1:
-        if (gEdits[0]) { SetWindowPos(gEdits[0], NULL, x, y + 24, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[1]) { SetWindowPos(gEdits[1], NULL, x, y + 84, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[2]) { SetWindowPos(gEdits[2], NULL, x, y + 144, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[3]) { SetWindowPos(gEdits[3], NULL, x, y + 204, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
+        if (gEdits[0]) SetWindowPos(gEdits[0], NULL, x, y + 24, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[1]) SetWindowPos(gEdits[1], NULL, x, y + 84, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[2]) SetWindowPos(gEdits[2], NULL, x, y + 144, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[3]) SetWindowPos(gEdits[3], NULL, x, y + 204, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
     case 2:
-        if (gEdits[4]) { SetWindowPos(gEdits[4], NULL, x, y + 24, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[5]) { SetWindowPos(gEdits[5], NULL, x, y + 84, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
+        if (gEdits[4]) SetWindowPos(gEdits[4], NULL, x, y + 24, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[5]) SetWindowPos(gEdits[5], NULL, x, y + 84, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
     case 3:
-        if (gEdits[6]) { SetWindowPos(gEdits[6], NULL, x, y + 24, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gChecks[0]) { SetWindowPos(gChecks[0], NULL, x, y + 70, 400, 22, SWP_NOZORDER | SWP_SHOWWINDOW); }
+        if (gEdits[6]) SetWindowPos(gEdits[6], NULL, x, y + 24, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gChecks[0]) SetWindowPos(gChecks[0], NULL, x, y + 70, 400, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
     case 4:
-        if (gEdits[7]) { SetWindowPos(gEdits[7], NULL, x, y + 24, 520, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[8]) { SetWindowPos(gEdits[8], NULL, x, y + 84, 800, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[9]) { SetWindowPos(gEdits[9], NULL, x, y + 144, 260, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gChecks[1]) { SetWindowPos(gChecks[1], NULL, x, y + 190, 280, 22, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gChecks[2]) { SetWindowPos(gChecks[2], NULL, x + 300, y + 190, 280, 22, SWP_NOZORDER | SWP_SHOWWINDOW); }
+        if (gEdits[7]) SetWindowPos(gEdits[7], NULL, x, y + 24, 520, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[8]) SetWindowPos(gEdits[8], NULL, x, y + 84, contentW, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[9]) SetWindowPos(gEdits[9], NULL, x, y + 144, 260, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gChecks[1]) SetWindowPos(gChecks[1], NULL, x, y + 190, 280, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gChecks[2]) SetWindowPos(gChecks[2], NULL, x + 300, y + 190, 280, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         {
             HWND b2 = GetDlgItem(h, IDC_TEST_CLOUD);
             HWND b3 = GetDlgItem(h, IDC_TEST_VT);
@@ -1791,7 +2123,7 @@ static void LayoutPage(HWND h)
         }
         break;
     case 5:
-        if (gChecks[3]) { SetWindowPos(gChecks[3], NULL, x, y + 24, 360, 22, SWP_NOZORDER | SWP_SHOWWINDOW); }
+        if (gChecks[3]) SetWindowPos(gChecks[3], NULL, x, y + 24, 360, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
     case 6:
         for (int i = 4; i <= 20; i++) {
@@ -1812,37 +2144,46 @@ static void LayoutPage(HWND h)
         if (gChecks[30]) SetWindowPos(gChecks[30], NULL, x + 400, y + 12 * 28, 380, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         if (gChecks[31]) SetWindowPos(gChecks[31], NULL, x, y + 13 * 28, 380, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
-    case 7:
-        if (gEdits[10]) { SetWindowPos(gEdits[10], NULL, x, y + 24, 660, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[11]) { SetWindowPos(gEdits[11], NULL, x, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[12]) { SetWindowPos(gEdits[12], NULL, x + 200, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gEdits[13]) { SetWindowPos(gEdits[13], NULL, x + 400, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        if (gChecks[21]) { SetWindowPos(gChecks[21], NULL, x, y + 126, 240, 22, SWP_NOZORDER | SWP_SHOWWINDOW); }
-        {
-            HWND b1 = GetDlgItem(h, IDC_BROWSE_LOG);
-            if (b1) SetWindowPos(b1, NULL, x + 680, y + 22, 90, 28, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-        if (gLogView) SetWindowPos(gLogView, NULL, x, y + 170, 820, 430, SWP_NOZORDER | SWP_SHOWWINDOW);
+    case 7: {
+        HWND b1 = GetDlgItem(h, IDC_BROWSE_LOG);
+        if (gEdits[10]) SetWindowPos(gEdits[10], NULL, x, y + 24, contentW - 108, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (b1) SetWindowPos(b1, NULL, x + contentW - 98, y + 22, 90, 28, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[11]) SetWindowPos(gEdits[11], NULL, x, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[12]) SetWindowPos(gEdits[12], NULL, x + 200, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gEdits[13]) SetWindowPos(gEdits[13], NULL, x + 400, y + 84, 80, 26, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gChecks[21]) SetWindowPos(gChecks[21], NULL, x, y + 126, 240, 22, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gLogView) SetWindowPos(gLogView, NULL, x, y + 170, contentW, chh - (y + 170) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
-    case 8:
-        if (gQuarList) SetWindowPos(gQuarList, NULL, x, y + 50, 820, 430, SWP_NOZORDER | SWP_SHOWWINDOW);
-        {
-            HWND r = GetDlgItem(h, IDC_QUAR_RESTORE);
-            HWND p = GetDlgItem(h, IDC_QUAR_PURGE);
-            if (r) SetWindowPos(r, NULL, x, y + 8, 120, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
-            if (p) SetWindowPos(p, NULL, x + 136, y + 8, 120, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
+    }
+    case 8: {
+        HWND r = GetDlgItem(h, IDC_QUAR_RESTORE);
+        HWND p = GetDlgItem(h, IDC_QUAR_PURGE);
+        if (r) SetWindowPos(r, NULL, x, y + 8, 120, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (p) SetWindowPos(p, NULL, x + 136, y + 8, 120, 30, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gQuarList) SetWindowPos(gQuarList, NULL, x, y + 50, contentW, chh - (y + 50) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
         RefreshQuarantineList();
         break;
-    case 9:
-        {
-            HWND hunt = GetDlgItem(h, IDC_HUNT);
-            HWND can = GetDlgItem(h, IDC_CANARY_PLANT);
-            if (hunt) SetWindowPos(hunt, NULL, x, y + 8, 160, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
-            if (can) SetWindowPos(can, NULL, x + 176, y + 8, 160, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-        if (gLogView) SetWindowPos(gLogView, NULL, x, y + 56, 820, 540, SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
+    case 9: {
+        HWND hunt = GetDlgItem(h, IDC_HUNT);
+        HWND can = GetDlgItem(h, IDC_CANARY_PLANT);
+        if (hunt) SetWindowPos(hunt, NULL, x, y + 8, 160, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (can) SetWindowPos(can, NULL, x + 176, y + 8, 160, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gLogView) SetWindowPos(gLogView, NULL, x, y + 56, contentW, chh - (y + 56) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
         break;
+    }
+    case 10: {
+        HWND hc = GetDlgItem(h, IDC_HEALTH_CHECK);
+        if (hc) SetWindowPos(hc, NULL, x, y + 8, 140, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gPostureList) SetWindowPos(gPostureList, NULL, x, y + 50, contentW, chh - (y + 50) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+        break;
+    }
+    case 11: {
+        HWND nr = GetDlgItem(h, IDC_NET_REFRESH);
+        if (nr) SetWindowPos(nr, NULL, x, y + 8, 140, 32, SWP_NOZORDER | SWP_SHOWWINDOW);
+        if (gNetList) SetWindowPos(gNetList, NULL, x, y + 50, contentW, chh - (y + 50) - 24, SWP_NOZORDER | SWP_SHOWWINDOW);
+        break;
+    }
     }
     InvalidateRect(h, NULL, TRUE);
 }
@@ -1999,12 +2340,14 @@ static void PaintMain(HWND h, HDC hdc)
 
     const wchar_t* nav[] = {
         L"总览", L"策略", L"端口", L"USB", L"云端",
-        L"TOTP", L"强化", L"日志", L"隔离", L"狩猎"
+        L"TOTP", L"强化", L"日志", L"隔离", L"狩猎",
+        L"体检", L"网络"
     };
     for (int i = 0; i < NAV_COUNT; i++) {
         RECT nr = { 10, 76 + i * 40, 198, 110 + i * 40 };
         if (i == gNav) DrawRoundCard(mem, nr, gBrAccent);
-        SetTextColor(mem, i == gNav ? RGB(255, 255, 255) : gColMuted);
+        else if (i == gNavHover) DrawRoundCard(mem, nr, gBrCard);
+        SetTextColor(mem, i == gNav ? RGB(255, 255, 255) : (i == gNavHover ? gColText : gColMuted));
         SelectObject(mem, gFontUi);
         DrawTextW(mem, nav[i], -1, &nr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -2015,8 +2358,15 @@ static void PaintMain(HWND h, HDC hdc)
     SetTextColor(mem, gColText);
     TextOutW(mem, 240, 24, L"行为防护中心", 6);
     SelectObject(mem, gFontSmall);
+    {
+        wchar_t scoreBuf[64];
+        COLORREF sc = gPostureTotal == 0 ? gColMuted : (gPostureScore >= 85 ? gColOk : (gPostureScore >= 60 ? gColWarn : gColBad));
+        StringCchPrintfW(scoreBuf, ARRAYSIZE(scoreBuf), L"体检评分 %d / 100", gPostureScore);
+        SetTextColor(mem, sc);
+        TextOutW(mem, 400, 32, scoreBuf, (int)wcslen(scoreBuf));
+    }
     SetTextColor(mem, gDriverOk ? gColOk : gColBad);
-    TextOutW(mem, 820, 30, gDriverOk ? L"内核已连接" : L"仅用户态防护", gDriverOk ? 5 : 6);
+    TextOutW(mem, 560, 32, gDriverOk ? L"内核已连接" : L"仅用户态防护", gDriverOk ? 5 : 6);
 
     if (gNav == 0) {
         struct { const wchar_t* t; ULONGLONG v; COLORREF c; } cards[] = {
@@ -2029,7 +2379,10 @@ static void PaintMain(HWND h, HDC hdc)
         };
         for (int i = 0; i < 6; i++) {
             int col = i % 3, row = i / 3;
-            RECT cr = { 220 + col * 274, 80 + row * 78, 482 + col * 274, 150 + row * 78 };
+            int cardW = (rc.right - 264 - 32) / 3;
+            if (cardW < 200) cardW = 200;
+            int cx = 220 + col * (cardW + 16);
+            RECT cr = { cx, 80 + row * 78, cx + cardW, 150 + row * 78 };
             DrawRoundCard(mem, cr, gBrCard);
             SetTextColor(mem, gColMuted);
             SelectObject(mem, gFontSmall);
@@ -2042,7 +2395,7 @@ static void PaintMain(HWND h, HDC hdc)
         }
         SelectObject(mem, gFontUi);
         SetTextColor(mem, gColMuted);
-        TextOutW(mem, 236, 246, L"实时拦截", 4);
+        TextOutW(mem, rc.right - 164, 262, L"实时拦截事件", 6);
     } else {
         SelectObject(mem, gFontUi);
         SetTextColor(mem, gColMuted);
@@ -2056,7 +2409,9 @@ static void PaintMain(HWND h, HDC hdc)
             L"系统强化与行为引擎开关。部分项需重启生效",
             L"日志目录、级别、滚动与保留",
             L"XOR 隔离舱。可还原或彻底清除样本",
-            L"持久化狩猎与勒索诱饵。点击按钮立即执行"
+            L"持久化狩猎与勒索诱饵。点击按钮立即执行",
+            L"一键安全体检。检查内核、防火墙、UAC、Secure Boot、凭据保护等",
+            L"实时 TCP/UDP 连接与监听端口，识别可疑外联进程"
         };
         RECT hintRc = { 236, 76, 1060, 108 };
         DrawTextW(mem, hints[gNav], -1, &hintRc, DT_LEFT | DT_WORDBREAK);
@@ -2145,20 +2500,42 @@ static void CreateUi(HWND h)
     MakeBtn(h, IDC_QUAR_PURGE, L"清除", 0, 0, 120, 30);
     MakeBtn(h, IDC_SCAN_FILE, L"扫描文件", 0, 0, 140, 32);
     MakeBtn(h, IDC_CANARY_PLANT, L"投放诱饵", 0, 0, 160, 32);
+    MakeBtn(h, IDC_HEALTH_CHECK, L"开始体检", 0, 0, 140, 32);
+    MakeBtn(h, IDC_NET_REFRESH, L"刷新连接", 0, 0, 140, 32);
+    MakeBtn(h, IDC_EVT_CLEAR, L"清空事件", 0, 0, 140, 32);
+    MakeBtn(h, IDC_EXPORT_REPORT, L"导出报告", 0, 0, 128, 30);
     gEvtList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_SINGLESEL | WS_BORDER,
         0, 0, 10, 10, h, (HMENU)IDC_EVT_LIST, GetModuleHandleW(NULL), NULL);
-    ListView_SetExtendedListViewStyle(gEvtList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetExtendedListViewStyle(gEvtList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
     SendMessageW(gEvtList, WM_SETFONT, (WPARAM)gFontUi, TRUE);
     LVCOLUMNW col = { LVCF_TEXT | LVCF_WIDTH };
-    col.pszText = L"类型"; col.cx = 90; ListView_InsertColumn(gEvtList, 0, &col);
-    col.pszText = L"PID"; col.cx = 70; ListView_InsertColumn(gEvtList, 1, &col);
-    col.pszText = L"路径"; col.cx = 640; ListView_InsertColumn(gEvtList, 2, &col);
+    col.pszText = L"时间"; col.cx = 100; ListView_InsertColumn(gEvtList, 0, &col);
+    col.pszText = L"类型"; col.cx = 90; ListView_InsertColumn(gEvtList, 1, &col);
+    col.pszText = L"PID"; col.cx = 70; ListView_InsertColumn(gEvtList, 2, &col);
+    col.pszText = L"路径"; col.cx = 620; ListView_InsertColumn(gEvtList, 3, &col);
     gQuarList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_SINGLESEL | WS_BORDER,
         0, 0, 10, 10, h, (HMENU)IDC_QUAR_LIST, GetModuleHandleW(NULL), NULL);
     ListView_SetExtendedListViewStyle(gQuarList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     SendMessageW(gQuarList, WM_SETFONT, (WPARAM)gFontUi, TRUE);
     col.pszText = L"样本"; col.cx = 220; ListView_InsertColumn(gQuarList, 0, &col);
     col.pszText = L"原始路径"; col.cx = 580; ListView_InsertColumn(gQuarList, 1, &col);
+    gPostureList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_SINGLESEL | WS_BORDER,
+        0, 0, 10, 10, h, (HMENU)IDC_POSTURE_LIST, GetModuleHandleW(NULL), NULL);
+    ListView_SetExtendedListViewStyle(gPostureList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
+    SendMessageW(gPostureList, WM_SETFONT, (WPARAM)gFontUi, TRUE);
+    col.pszText = L"检查项"; col.cx = 260; ListView_InsertColumn(gPostureList, 0, &col);
+    col.pszText = L"状态"; col.cx = 80; ListView_InsertColumn(gPostureList, 1, &col);
+    col.pszText = L"建议"; col.cx = 470; ListView_InsertColumn(gPostureList, 2, &col);
+    gNetList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_SINGLESEL | WS_BORDER,
+        0, 0, 10, 10, h, (HMENU)IDC_NET_LIST, GetModuleHandleW(NULL), NULL);
+    ListView_SetExtendedListViewStyle(gNetList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
+    SendMessageW(gNetList, WM_SETFONT, (WPARAM)gFontUi, TRUE);
+    col.pszText = L"协议"; col.cx = 60; ListView_InsertColumn(gNetList, 0, &col);
+    col.pszText = L"本地地址"; col.cx = 190; ListView_InsertColumn(gNetList, 1, &col);
+    col.pszText = L"远程地址"; col.cx = 190; ListView_InsertColumn(gNetList, 2, &col);
+    col.pszText = L"状态"; col.cx = 110; ListView_InsertColumn(gNetList, 3, &col);
+    col.pszText = L"PID"; col.cx = 70; ListView_InsertColumn(gNetList, 4, &col);
+    col.pszText = L"进程"; col.cx = 200; ListView_InsertColumn(gNetList, 5, &col);
     gLogView = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_BORDER,
         0, 0, 10, 10, h, (HMENU)IDC_LOG_VIEW, GetModuleHandleW(NULL), NULL);
     SendMessageW(gLogView, WM_SETFONT, (WPARAM)gFontSmall, TRUE);
@@ -2231,13 +2608,39 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetBkColor(hdc, gColCard);
         return (LRESULT)gBrCard;
     }
+    case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(l), my = GET_Y_LPARAM(l);
+        int hover = -1;
+        if (mx < 208 && my >= 76 && my < 76 + NAV_COUNT * 40) hover = (my - 76) / 40;
+        if (hover != gNavHover) {
+            gNavHover = hover;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        if (!gNavTracking) {
+            TRACKMOUSEEVENT tme = { sizeof(tme) };
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = h;
+            TrackMouseEvent(&tme);
+            gNavTracking = TRUE;
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        gNavTracking = FALSE;
+        if (gNavHover != -1) {
+            gNavHover = -1;
+            InvalidateRect(h, NULL, FALSE);
+        }
+        return 0;
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
         if (x < 208 && y >= 76 && y < 76 + NAV_COUNT * 40) {
             int n = (y - 76) / 40;
             if (n != gNav) {
-                if (n != 0 && !GuardSettings(h)) break;
+                if (n >= 1 && n <= 7 && !GuardSettings(h)) break;
                 gNav = n;
+                if (n == 10) RunHealthCheck();
+                else if (n == 11) RefreshNetworkView();
                 LayoutPage(h);
             }
         }
@@ -2310,8 +2713,51 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             PlantCanaries();
             MessageBoxW(h, L"已在桌面、文档、下载目录投放诱饵。", L"诱饵", MB_OK);
             break;
+        case IDC_HEALTH_CHECK:
+            RunHealthCheck();
+            break;
+        case IDC_NET_REFRESH:
+            RefreshNetworkView();
+            break;
+        case IDC_EVT_CLEAR:
+            if (gEvtList) ListView_DeleteAllItems(gEvtList);
+            gEvtCount = 0;
+            break;
+        case IDC_EXPORT_REPORT:
+            ExportReport();
+            break;
         }
         return 0;
+    case WM_NOTIFY: {
+        LPNMHDR nh = (LPNMHDR)l;
+        if (nh && nh->idFrom == IDC_EVT_LIST) {
+            if (nh->code == NM_CUSTOMDRAW) {
+                LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)l;
+                if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                    LVITEMW li = { 0 };
+                    li.mask = LVIF_PARAM;
+                    li.iItem = (int)cd->nmcd.dwItemSpec;
+                    if (gEvtList && ListView_GetItem(gEvtList, &li)) {
+                        int t = (int)li.lParam;
+                        if (t == ZTG_EVENT_RANSOM || t == ZTG_EVENT_LSASS) cd->clrText = gColBad;
+                        else if (t == ZTG_EVENT_LOLBIN || t == ZTG_EVENT_PERSIST) cd->clrText = gColWarn;
+                    }
+                    return CDRF_DODEFAULT;
+                }
+            } else if (nh->code == NM_DBLCLK) {
+                int sel = ListView_GetNextItem(gEvtList, -1, LVNI_SELECTED);
+                if (sel >= 0) {
+                    wchar_t type[64] = { 0 }, path[512] = { 0 }, msg[640];
+                    ListView_GetItemText(gEvtList, sel, 1, type, ARRAYSIZE(type));
+                    ListView_GetItemText(gEvtList, sel, 3, path, ARRAYSIZE(path));
+                    StringCchPrintfW(msg, ARRAYSIZE(msg), L"类型: %s\n路径: %s", type, path);
+                    MessageBoxW(h, msg, L"事件详情", MB_ICONINFORMATION);
+                }
+            }
+        }
+        return 0;
+    }
     case WM_TIMER:
         if (w == IDT_STATS) {
             RefreshStats();
@@ -2346,14 +2792,26 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 else if (e->type == ZTG_EVENT_PERSIST) k = L"持久化";
                 else if (e->type == ZTG_EVENT_RANSOM) k = L"勒索";
                 LVITEMW it = { 0 };
-                it.mask = LVIF_TEXT;
+                it.mask = LVIF_TEXT | LVIF_PARAM;
                 it.iItem = 0;
                 it.pszText = (LPWSTR)k;
+                it.lParam = (LPARAM)e->type;
                 int row = ListView_InsertItem(gEvtList, &it);
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                wchar_t tb[16];
+                StringCchPrintfW(tb, ARRAYSIZE(tb), L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+                ListView_SetItemText(gEvtList, row, 0, tb);
+                ListView_SetItemText(gEvtList, row, 1, k);
                 wchar_t pid[16];
                 StringCchPrintfW(pid, ARRAYSIZE(pid), L"%u", e->pid);
-                ListView_SetItemText(gEvtList, row, 1, pid);
-                ListView_SetItemText(gEvtList, row, 2, e->path);
+                ListView_SetItemText(gEvtList, row, 2, pid);
+                ListView_SetItemText(gEvtList, row, 3, e->path);
+                gEvtCount++;
+                gLastEventTime[0] = tb[0]; gLastEventTime[1] = tb[1]; gLastEventTime[2] = tb[2];
+                gLastEventTime[3] = tb[3]; gLastEventTime[4] = tb[4]; gLastEventTime[5] = tb[5];
+                gLastEventTime[6] = tb[6]; gLastEventTime[7] = tb[7];
+                gLastEventTime[8] = 0;
             }
             free(e);
         }
@@ -2366,7 +2824,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_SIZE:
         if (w == SIZE_MINIMIZED) ShowWindow(h, SW_HIDE);
+        else if (gMain) LayoutPage(h);
         return 0;
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mmi = (MINMAXINFO*)l;
+        mmi->ptMinTrackSize.x = 1060;
+        mmi->ptMinTrackSize.y = 720;
+        return 0;
+    }
     case WM_DESTROY:
         KillTimer(h, IDT_STATS);
         KillTimer(h, IDT_HEARTBEAT);
@@ -2430,7 +2895,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     RegisterClassExW(&wc);
 
     HWND wnd = CreateWindowExW(0, wc.lpszClassName, L"ZeroTrustGuard",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 1140, 780, NULL, NULL, inst, NULL);
     ShowWindow(wnd, show);
     UpdateWindow(wnd);
