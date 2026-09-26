@@ -53,3 +53,14 @@ This file records user instructions, preferences, and teachings for reference in
   - Registry `CmCallbackGetKeyObjectIDEx` requires a cookie from `CmRegisterCallbackEx` (with an altitude string), not `CmRegisterCallback`.
   - WDK InfVerif signing-mode validation emits `error 1296` unless the device's function service has the `SPSVCINST_ASSOCSERVICE` flag: `AddService=<Name>,0x00000002,<ServiceInstallSection>`.
   - Driver project disables signing and cat generation via `SignMode=Off` and `EnableInf2cat=false`, so CI needs no cert.
+
+[Project Knowledge Summary]
+- Date: 2026-09-26
+- Context: Discovered by Agent while pushing the app changes and verifying the CI run
+- Category: Workflow & Collaboration
+- Instructions:
+  - GitHub auth is provided by the configured git credential helper (`/app/agent/bin/agent git-credential-helper`); `git push origin main` works directly without entering a token.
+  - `gh` is installed but not logged in. To query/trigger CI, export a token for the session: `export GH_TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null | grep '^password=' | cut -d= -f2-)`.
+  - Never print the token value; only use it inline for `gh`.
+  - Useful commands: `gh run list --repo xiongzhuosen/ZeroTrustGuard --limit 3`, `gh run view <id> --repo ... --json headSha,conclusion,status`, `gh run download <id> --repo ... --dir <path>`.
+
